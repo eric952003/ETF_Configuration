@@ -1,0 +1,10 @@
+# 忽略 Streamlit 本地金鑰設定
+.streamlit/secrets.toml
+
+# 忽略所有下載的 Google 服務帳戶 JSON 金鑰檔案
+*.json
+
+# 忽略 Python 暫存與快取
+__pycache__/
+*.pyc
+.env
