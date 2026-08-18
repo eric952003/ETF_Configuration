@@ -1,13 +1,16 @@
 from datetime import datetime
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import yfinance as yf
 
+# -------------------------------------------------------------
+# 1. 基本設定與常數定義
+# -------------------------------------------------------------
 st.set_page_config(page_title="投資組合資產配置監控", layout="wide")
 
-# 1. 目標比例與警示容許誤差設定
 TARGET_ALLOCATION = {
     "市值型": 40.0,
     "高股息": 25.0,
@@ -20,6 +23,9 @@ TOLERANCE_PCT = 3.0
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 
+# -------------------------------------------------------------
+# 2. 資料讀取與 API 快取函數 (含強固防呆)
+# -------------------------------------------------------------
 def load_portfolio_data():
     """從 Google Sheet 讀取最新持股資料"""
     df = conn.read(ttl=0)
@@ -39,8 +45,13 @@ def get_usd_twd_rate():
     try:
         usd = yf.Ticker("TWD=X")
         rate = usd.fast_info.get("last_price")
-        if not rate or pd.isna(rate):
-            rate = usd.history(period="5d")["Close"].iloc[-1]
+        if rate is None or pd.isna(rate):
+            hist = usd.history(period="5d")
+            rate = (
+                hist["Close"].dropna().iloc[-1]
+                if (not hist.empty and "Close" in hist.columns)
+                else 32.0
+            )
         return float(rate)
     except Exception:
         return 32.0
@@ -48,29 +59,56 @@ def get_usd_twd_rate():
 
 @st.cache_data(ttl=300)
 def fetch_stock_info(symbol):
-    """取得單一股票/ETF最新市價與當月除息金額"""
+    """取得單一股票/ETF最新市價與當月除息金額 (完整防呆版)"""
     price = 0.0
     current_month_div = 0.0
+
+    if not symbol or pd.isna(symbol):
+        return 0.0, 0.0
+
+    symbol = str(symbol).strip()
+    if not symbol:
+        return 0.0, 0.0
+
     try:
         ticker = yf.Ticker(symbol)
-        # 取得市價
-        price = ticker.fast_info.get("last_price")
-        if not price or pd.isna(price):
-            hist = ticker.history(period="5d")
-            price = hist["Close"].iloc[-1] if not hist.empty else 0.0
 
-        # 取得除息紀錄並篩選當月
-        now = datetime.now()
-        divs = ticker.dividends
-        if not divs.empty:
-            # 轉換時區以利比對
-            divs.index = pd.to_datetime(divs.index).tz_localize(None)
-            # 篩選今年當月的除權息紀錄
-            m_divs = divs[
-                (divs.index.year == now.year) & (divs.index.month == now.month)
-            ]
-            if not m_divs.empty:
-                current_month_div = float(m_divs.sum())
+        # 1. 取得市價
+        try:
+            p = ticker.fast_info.get("last_price")
+            if p is not None and not pd.isna(p):
+                price = float(p)
+            else:
+                hist = ticker.history(period="5d")
+                if not hist.empty and "Close" in hist.columns:
+                    valid_closes = hist["Close"].dropna()
+                    if not valid_closes.empty:
+                        price = float(valid_closes.iloc[-1])
+        except Exception:
+            price = 0.0
+
+        # 2. 取得當月除權息金額
+        try:
+            divs = ticker.dividends
+            if (
+                divs is not None
+                and hasattr(divs, "empty")
+                and not divs.empty
+                and hasattr(divs, "index")
+            ):
+                div_dates = pd.to_datetime(divs.index).tz_localize(None)
+                now = datetime.now()
+                mask = (div_dates.year == now.year) & (
+                    div_dates.month == now.month
+                )
+                m_divs = divs[mask]
+                if not m_divs.empty:
+                    val = m_divs.sum()
+                    if val is not None and pd.notna(val):
+                        current_month_div = float(val)
+        except Exception:
+            current_month_div = 0.0
+
     except Exception:
         pass
 
@@ -78,11 +116,11 @@ def fetch_stock_info(symbol):
 
 
 # -------------------------------------------------------------
-# 2. 介面呈現與編輯器
+# 3. 網頁標題與持股編輯器
 # -------------------------------------------------------------
 st.title("📊 投資組合資產配置與現金流監控")
 st.caption(
-    "💡 支援台股與美股標的即時報價、當月除息可用資金計算與 Google Sheet 雙向同步"
+    "💡 支援台美股即時報價、當月除息可用資金計算與 Google Sheet 雙向同步"
 )
 
 try:
@@ -125,7 +163,7 @@ if st.button("💾 儲存修改至雲端", type="primary"):
         st.error(f"儲存失敗: {e}")
 
 # -------------------------------------------------------------
-# 3. 市值與當月股息計算
+# 4. 市值計算與當月除息現金流統計
 # -------------------------------------------------------------
 st.divider()
 valid_df = edited_df.dropna(subset=["代號"]).copy()
@@ -175,7 +213,7 @@ if not valid_df.empty:
         col_m4.metric("📌 持有標的數", f"{len(valid_df)} 檔")
 
         # -------------------------------------------------------------
-        # 4. 當月可用再投資金額規劃
+        # 5. 當月可用資金規劃
         # -------------------------------------------------------------
         st.subheader("💵 當月可用投資資金規劃")
         col_inp, col_res = st.columns([1, 1])
@@ -197,7 +235,7 @@ if not valid_df.empty:
             )
 
         # -------------------------------------------------------------
-        # 5. 資產配置與再平衡建議
+        # 6. 資產配置與再平衡建議
         # -------------------------------------------------------------
         summary_rows = []
         under_allocated_cats = []
@@ -285,7 +323,7 @@ if not valid_df.empty:
                     )
             else:
                 st.success(
-                    "🎉 目前所有資產類別皆在合理平衡區間內！本月可用資金可依目標比例（市值型 40%、高股息 25% 等）等比例投入。"
+                    "🎉 目前所有資產類別皆在合理平衡區間內！本月可用資金可依目標比例等比例投入。"
                 )
         else:
             st.info("💡 若當月無除權息或尚未設定新增資金，可用金額為 0 元。")
