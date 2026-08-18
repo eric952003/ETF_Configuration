@@ -1,3 +1,4 @@
+from datetime import datetime
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -16,7 +17,6 @@ TARGET_ALLOCATION = {
 }
 TOLERANCE_PCT = 3.0
 
-# 建立 Google Sheets 連線物件
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 
@@ -27,7 +27,6 @@ def load_portfolio_data():
         return pd.DataFrame(columns=["代號", "名稱", "類別", "持股數", "幣別"])
 
     df = df.dropna(how="all")
-    # 確保必要欄位存在
     for col in ["代號", "名稱", "類別", "持股數", "幣別"]:
         if col not in df.columns:
             df[col] = ""
@@ -48,28 +47,44 @@ def get_usd_twd_rate():
 
 
 @st.cache_data(ttl=300)
-def fetch_price(symbol):
-    """取得單一股票/ETF最新市價"""
+def fetch_stock_info(symbol):
+    """取得單一股票/ETF最新市價與當月除息金額"""
+    price = 0.0
+    current_month_div = 0.0
     try:
         ticker = yf.Ticker(symbol)
+        # 取得市價
         price = ticker.fast_info.get("last_price")
         if not price or pd.isna(price):
             hist = ticker.history(period="5d")
             price = hist["Close"].iloc[-1] if not hist.empty else 0.0
-        return float(price)
+
+        # 取得除息紀錄並篩選當月
+        now = datetime.now()
+        divs = ticker.dividends
+        if not divs.empty:
+            # 轉換時區以利比對
+            divs.index = pd.to_datetime(divs.index).tz_localize(None)
+            # 篩選今年當月的除權息紀錄
+            m_divs = divs[
+                (divs.index.year == now.year) & (divs.index.month == now.month)
+            ]
+            if not m_divs.empty:
+                current_month_div = float(m_divs.sum())
     except Exception:
-        return 0.0
+        pass
+
+    return float(price), float(current_month_div)
 
 
 # -------------------------------------------------------------
 # 2. 介面呈現與編輯器
 # -------------------------------------------------------------
-st.title("📊 投資組合資產配置與雲端同步監控")
+st.title("📊 投資組合資產配置與現金流監控")
 st.caption(
-    "💡 支援台股 (.TW / .TWO) 與美股標的，資料直接與 Google 試算表即時雙向同步"
+    "💡 支援台股與美股標的即時報價、當月除息可用資金計算與 Google Sheet 雙向同步"
 )
 
-# 讀取 Google Sheets 現有資料
 try:
     current_df = load_portfolio_data()
 except Exception as e:
@@ -79,14 +94,12 @@ except Exception as e:
     )
 
 st.subheader("✏️ 持股編輯器")
-st.info("可以在表格直接點擊修改、新增或刪除列，編輯完成後請點擊下方「💾 儲存修改至雲端」。")
-
 edited_df = st.data_editor(
     current_df,
     num_rows="dynamic",
     column_config={
         "代號": st.column_config.TextColumn(
-            "標的代號 (例如 0050.TW, VT)", required=True
+            "標的代號 (例如 0050.TW, 00878.TW, VT)", required=True
         ),
         "名稱": st.column_config.TextColumn("標的名稱", required=True),
         "類別": st.column_config.SelectboxColumn(
@@ -102,14 +115,8 @@ edited_df = st.data_editor(
     use_container_width=True,
 )
 
-# 儲存按鈕
-col_btn1, col_btn2 = st.columns([1, 4])
-with col_btn1:
-    save_clicked = st.button("💾 儲存修改至雲端", type="primary")
-
-if save_clicked:
+if st.button("💾 儲存修改至雲端", type="primary"):
     try:
-        # 清除空白列並回寫 Google Sheet
         clean_df = edited_df.dropna(subset=["代號"])
         conn.update(data=clean_df)
         st.success("✅ 已成功同步保存至 Google 試算表！")
@@ -118,41 +125,83 @@ if save_clicked:
         st.error(f"儲存失敗: {e}")
 
 # -------------------------------------------------------------
-# 3. 市值計算與再平衡邏輯
+# 3. 市值與當月股息計算
 # -------------------------------------------------------------
 st.divider()
-
 valid_df = edited_df.dropna(subset=["代號"]).copy()
 
 if not valid_df.empty:
-    with st.spinner("正在爬取即時股價與匯率..."):
+    with st.spinner("正在爬取即時股價、當月配息與匯率..."):
         usd_rate = get_usd_twd_rate()
+        now = datetime.now()
         prices = []
         market_values = []
+        div_per_share_list = []
+        total_div_twd_list = []
 
         for _, row in valid_df.iterrows():
             sym = str(row["代號"]).strip()
             shares = float(row["持股數"]) if pd.notna(row["持股數"]) else 0.0
             curr = str(row["幣別"]).strip()
 
-            p = fetch_price(sym)
+            p, d = fetch_stock_info(sym)
+            rate_factor = usd_rate if curr == "USD" else 1.0
+
+            val = p * shares * rate_factor
+            div_val = d * shares * rate_factor
+
             prices.append(p)
-            val = p * shares * (usd_rate if curr == "USD" else 1.0)
             market_values.append(val)
+            div_per_share_list.append(d)
+            total_div_twd_list.append(div_val)
 
         calc_df = valid_df.copy()
         calc_df["即時單價"] = prices
         calc_df["市值(TWD)"] = market_values
+        calc_df["當月單股配息"] = div_per_share_list
+        calc_df["當月預估配息(TWD)"] = total_div_twd_list
+
         total_value = sum(market_values)
+        total_monthly_dividends = sum(total_div_twd_list)
 
-        # 頂部數據儀表板
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("💰 投資組合總市值 (TWD)", f"{total_value:,.0f} 元")
-        col_m2.metric("💵 USD/TWD 即時匯率", f"{usd_rate:.2f}")
-        col_m3.metric("📌 持有標的總數", f"{len(valid_df)} 檔")
+        # 頂部儀表板
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("💰 投資組合總市值", f"{total_value:,.0f} 元")
+        col_m2.metric(
+            f"📅 {now.month} 月除息預估股息",
+            f"{total_monthly_dividends:,.0f} 元",
+        )
+        col_m3.metric("💵 USD/TWD 匯率", f"{usd_rate:.2f}")
+        col_m4.metric("📌 持有標的數", f"{len(valid_df)} 檔")
 
-        # 統計各大類別
+        # -------------------------------------------------------------
+        # 4. 當月可用再投資金額規劃
+        # -------------------------------------------------------------
+        st.subheader("💵 當月可用投資資金規劃")
+        col_inp, col_res = st.columns([1, 1])
+
+        with col_inp:
+            extra_budget = st.number_input(
+                "➕ 本月預計新增投入資金 (定期定額/薪資投入, TWD)",
+                min_value=0,
+                value=0,
+                step=1000,
+            )
+            total_investable = total_monthly_dividends + extra_budget
+
+        with col_res:
+            st.metric(
+                label=f"🎯 {now.month} 月總可用投資金額 (股息 + 新增資金)",
+                value=f"{total_investable:,.0f} 元",
+                help="當月已除息或預估發放的股息現金，加上額外新增預算，可用於再平衡補進欠配資產",
+            )
+
+        # -------------------------------------------------------------
+        # 5. 資產配置與再平衡建議
+        # -------------------------------------------------------------
         summary_rows = []
+        under_allocated_cats = []
+
         for cat, target_pct in TARGET_ALLOCATION.items():
             cat_val = calc_df[calc_df["類別"] == cat]["市值(TWD)"].sum()
             actual_pct = (
@@ -162,15 +211,16 @@ if not valid_df.empty:
             target_val = total_value * (target_pct / 100.0)
             rebalance_amt = target_val - cat_val
 
-            if diff_pct > TOLERANCE_PCT:
-                status = "⚠️ 超配 (Over)"
-                sugg = f"比重偏高 **+{diff_pct:.1f}%**，建議暫停投入或調節賣出約 **{abs(rebalance_amt):,.0f}** 元"
-            elif diff_pct < -TOLERANCE_PCT:
+            if diff_pct < -TOLERANCE_PCT:
                 status = "📉 欠配 (Under)"
-                sugg = f"比重偏低 **{diff_pct:.1f}%**，建議定期定額或新增資金優先加碼約 **{rebalance_amt:,.0f}** 元"
+                under_allocated_cats.append((cat, rebalance_amt))
+                sugg = f"比重偏低 **{diff_pct:.1f}%**，建議加碼約 **{rebalance_amt:,.0f}** 元"
+            elif diff_pct > TOLERANCE_PCT:
+                status = "⚠️ 超配 (Over)"
+                sugg = f"比重偏高 **+{diff_pct:.1f}%**，建議暫停投入約 **{abs(rebalance_amt):,.0f}** 元"
             else:
                 status = "✅ 正常 (Normal)"
-                sugg = "比例符合目標配置，維持現有策略"
+                sugg = "比例符合目標配置，維持現有步調"
 
             summary_rows.append(
                 {
@@ -186,9 +236,7 @@ if not valid_df.empty:
 
         sum_df = pd.DataFrame(summary_rows)
 
-        # 圓餅圖與類別清單
         col_chart, col_data = st.columns([1, 1])
-
         with col_chart:
             st.subheader("🥧 實際資產佔比分佈")
             fig = px.pie(
@@ -217,20 +265,29 @@ if not valid_df.empty:
                 height=250,
             )
 
-        # 再平衡警示面板
-        st.subheader("💡 再平衡與風險提示")
-        for _, r in sum_df.iterrows():
-            if "超配" in r["狀態"]:
-                st.warning(
-                    f"**【{r['類別']}】（目標 {r['目標佔比']:.0f}% / 實際 {r['實際佔比']:.1f}%）**：{r['建議']}"
+        # 資金分配指引
+        st.subheader("💡 當月可用資金再平衡配置建議")
+        if total_investable > 0:
+            if under_allocated_cats:
+                total_under_need = sum([amt for _, amt in under_allocated_cats])
+                st.write(
+                    f"您本月共有 **{total_investable:,.0f}** 元可用於再平衡，建議依欠配比例分配至以下類別："
                 )
-            elif "欠配" in r["狀態"]:
-                st.info(
-                    f"**【{r['類別']}】（目標 {r['目標佔比']:.0f}% / 實際 {r['實際佔比']:.1f}%）**：{r['建議']}"
-                )
+                for cat, need_amt in under_allocated_cats:
+                    ratio = (
+                        (need_amt / total_under_need)
+                        if total_under_need > 0
+                        else (1 / len(under_allocated_cats))
+                    )
+                    allocate_for_cat = total_investable * ratio
+                    st.success(
+                        f"👉 **【{cat}】**：建議分配 **{allocate_for_cat:,.0f}** 元（目標需補足約 {need_amt:,.0f} 元）"
+                    )
             else:
                 st.success(
-                    f"**【{r['類別']}】（目標 {r['目標佔比']:.0f}% / 實際 {r['實際佔比']:.1f}%）**：{r['建議']}"
+                    "🎉 目前所有資產類別皆在合理平衡區間內！本月可用資金可依目標比例（市值型 40%、高股息 25% 等）等比例投入。"
                 )
+        else:
+            st.info("💡 若當月無除權息或尚未設定新增資金，可用金額為 0 元。")
 else:
-    st.info("💡 目前 Google 試算表中尚無持股資料，請在上方表格新增股票並點擊儲存。")
+    st.info("💡 目前尚無持股資料，請在上方表格輸入標的並點擊儲存。")
