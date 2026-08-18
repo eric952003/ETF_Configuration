@@ -1,4 +1,3 @@
-from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -24,7 +23,7 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 
 
 # -------------------------------------------------------------
-# 2. 資料讀取與 API 快取函數 (含強固防呆)
+# 2. 資料讀取與 API 快取函數
 # -------------------------------------------------------------
 def load_portfolio_data():
     """從 Google Sheet 讀取最新持股資料"""
@@ -59,9 +58,9 @@ def get_usd_twd_rate():
 
 @st.cache_data(ttl=300)
 def fetch_stock_info(symbol):
-    """取得單一股票/ETF最新市價與當月除息金額 (完整防呆版)"""
+    """取得最新市價與預估每月每股平均配息 (TTM 近12個月累計 / 12)"""
     price = 0.0
-    current_month_div = 0.0
+    monthly_est_div = 0.0
 
     if not symbol or pd.isna(symbol):
         return 0.0, 0.0
@@ -73,7 +72,7 @@ def fetch_stock_info(symbol):
     try:
         ticker = yf.Ticker(symbol)
 
-        # 1. 取得市價
+        # 1. 取得即時市價
         try:
             p = ticker.fast_info.get("last_price")
             if p is not None and not pd.isna(p):
@@ -87,7 +86,7 @@ def fetch_stock_info(symbol):
         except Exception:
             price = 0.0
 
-        # 2. 取得當月除權息金額
+        # 2. 取得近 12 個月配息並換算月均現金流
         try:
             divs = ticker.dividends
             if (
@@ -97,22 +96,23 @@ def fetch_stock_info(symbol):
                 and hasattr(divs, "index")
             ):
                 div_dates = pd.to_datetime(divs.index).tz_localize(None)
-                now = datetime.now()
-                mask = (div_dates.year == now.year) & (
-                    div_dates.month == now.month
-                )
-                m_divs = divs[mask]
-                if not m_divs.empty:
-                    val = m_divs.sum()
-                    if val is not None and pd.notna(val):
-                        current_month_div = float(val)
+                one_year_ago = pd.Timestamp.now() - pd.Timedelta(days=365)
+                recent_divs = divs[div_dates >= one_year_ago]
+
+                if not recent_divs.empty:
+                    total_year_div = float(recent_divs.sum())
+                    monthly_est_div = total_year_div / 12.0
+                else:
+                    # 若近一年無除息紀錄但歷史有，取最新一筆依季配/年配保守估算
+                    last_val = float(divs.dropna().iloc[-1])
+                    monthly_est_div = last_val / 12.0
         except Exception:
-            current_month_div = 0.0
+            monthly_est_div = 0.0
 
     except Exception:
         pass
 
-    return float(price), float(current_month_div)
+    return float(price), float(monthly_est_div)
 
 
 # -------------------------------------------------------------
@@ -120,7 +120,7 @@ def fetch_stock_info(symbol):
 # -------------------------------------------------------------
 st.title("📊 投資組合資產配置與現金流監控")
 st.caption(
-    "💡 支援台美股即時報價、當月除息可用資金計算與 Google Sheet 雙向同步"
+    "💡 支援台美股即時報價、預估每月股息現金流計算與 Google Sheet 雙向同步"
 )
 
 try:
@@ -163,51 +163,51 @@ if st.button("💾 儲存修改至雲端", type="primary"):
         st.error(f"儲存失敗: {e}")
 
 # -------------------------------------------------------------
-# 4. 市值計算與當月除息現金流統計
+# 4. 市值計算與每月股息現金流統計
 # -------------------------------------------------------------
 st.divider()
 valid_df = edited_df.dropna(subset=["代號"]).copy()
 
 if not valid_df.empty:
-    with st.spinner("正在爬取即時股價、當月配息與匯率..."):
+    with st.spinner("正在爬取即時股價、配息歷史與匯率..."):
         usd_rate = get_usd_twd_rate()
-        now = datetime.now()
         prices = []
         market_values = []
-        div_per_share_list = []
-        total_div_twd_list = []
+        monthly_div_per_share_list = []
+        monthly_div_twd_list = []
 
         for _, row in valid_df.iterrows():
             sym = str(row["代號"]).strip()
             shares = float(row["持股數"]) if pd.notna(row["持股數"]) else 0.0
             curr = str(row["幣別"]).strip()
 
-            p, d = fetch_stock_info(sym)
+            p, d_month = fetch_stock_info(sym)
             rate_factor = usd_rate if curr == "USD" else 1.0
 
             val = p * shares * rate_factor
-            div_val = d * shares * rate_factor
+            div_val = d_month * shares * rate_factor
 
             prices.append(p)
             market_values.append(val)
-            div_per_share_list.append(d)
-            total_div_twd_list.append(div_val)
+            monthly_div_per_share_list.append(d_month)
+            monthly_div_twd_list.append(div_val)
 
         calc_df = valid_df.copy()
         calc_df["即時單價"] = prices
         calc_df["市值(TWD)"] = market_values
-        calc_df["當月單股配息"] = div_per_share_list
-        calc_df["當月預估配息(TWD)"] = total_div_twd_list
+        calc_df["預估月均每股配息"] = monthly_div_per_share_list
+        calc_df["預估每月配息(TWD)"] = monthly_div_twd_list
 
         total_value = sum(market_values)
-        total_monthly_dividends = sum(total_div_twd_list)
+        total_monthly_dividends = sum(monthly_div_twd_list)
 
         # 頂部儀表板
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         col_m1.metric("💰 投資組合總市值", f"{total_value:,.0f} 元")
         col_m2.metric(
-            f"📅 {now.month} 月除息預估股息",
+            "📅 預估每月平均股息",
             f"{total_monthly_dividends:,.0f} 元",
+            help="基於各標的過去 12 個月歷史配息紀錄所折算之平均每月被動現金流",
         )
         col_m3.metric("💵 USD/TWD 匯率", f"{usd_rate:.2f}")
         col_m4.metric("📌 持有標的數", f"{len(valid_df)} 檔")
@@ -229,9 +229,9 @@ if not valid_df.empty:
 
         with col_res:
             st.metric(
-                label=f"🎯 {now.month} 月總可用投資金額 (股息 + 新增資金)",
+                label="🎯 本月總可用投資金額 (月均股息 + 新增資金)",
                 value=f"{total_investable:,.0f} 元",
-                help="當月已除息或預估發放的股息現金，加上額外新增預算，可用於再平衡補進欠配資產",
+                help="預估每月平均股息現金流，加上額外新增預算，可用於再平衡補進欠配資產",
             )
 
         # -------------------------------------------------------------
@@ -326,6 +326,6 @@ if not valid_df.empty:
                     "🎉 目前所有資產類別皆在合理平衡區間內！本月可用資金可依目標比例等比例投入。"
                 )
         else:
-            st.info("💡 若當月無除權息或尚未設定新增資金，可用金額為 0 元。")
+            st.info("💡 若目前無配息現金流或尚未設定新增資金，可用金額為 0 元。")
 else:
     st.info("💡 目前尚無持股資料，請在上方表格輸入標的並點擊儲存。")
