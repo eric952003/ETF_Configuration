@@ -6,18 +6,9 @@ from streamlit_gsheets import GSheetsConnection
 import yfinance as yf
 
 # -------------------------------------------------------------
-# 1. 基本設定與常數定義
+# 1. 基本頁面設定
 # -------------------------------------------------------------
 st.set_page_config(page_title="投資組合資產配置監控", layout="wide")
-
-TARGET_ALLOCATION = {
-    "市值型": 40.0,
-    "高股息": 25.0,
-    "全球型": 20.0,
-    "主動型": 10.0,
-    "債券": 5.0,
-}
-TOLERANCE_PCT = 3.0
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
@@ -103,7 +94,6 @@ def fetch_stock_info(symbol):
                     total_year_div = float(recent_divs.sum())
                     monthly_est_div = total_year_div / 12.0
                 else:
-                    # 若近一年無除息紀錄但歷史有，取最新一筆依季配/年配保守估算
                     last_val = float(divs.dropna().iloc[-1])
                     monthly_est_div = last_val / 12.0
         except Exception:
@@ -116,11 +106,90 @@ def fetch_stock_info(symbol):
 
 
 # -------------------------------------------------------------
-# 3. 網頁標題與持股編輯器
+# 3. 側邊欄：目標資產配置比例調整器
+# -------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ 目標配置比例設定")
+    st.caption("請在此自訂各資產類別的目標權重（合計需為 100%）")
+
+    target_market = st.number_input(
+        "📈 市值型 (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=40.0,
+        step=5.0,
+        key="target_market",
+    )
+    target_dividend = st.number_input(
+        "💰 高股息 (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=25.0,
+        step=5.0,
+        key="target_dividend",
+    )
+    target_global = st.number_input(
+        "🌍 全球型 (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=20.0,
+        step=5.0,
+        key="target_global",
+    )
+    target_active = st.number_input(
+        "🚀 主動型 (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=10.0,
+        step=5.0,
+        key="target_active",
+    )
+    target_bond = st.number_input(
+        "🛡️ 債券 (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=5.0,
+        step=5.0,
+        key="target_bond",
+    )
+
+    total_target = (
+        target_market
+        + target_dividend
+        + target_global
+        + target_active
+        + target_bond
+    )
+
+    if total_target == 100.0:
+        st.success(f"✅ 目標比例總和：{total_target:.0f}%")
+    else:
+        st.error(
+            f"⚠️ 目標比例總和為 **{total_target:.1f}%**，請調整至剛好 100%"
+        )
+
+    tolerance_pct = st.slider(
+        "🎯 警示容許誤差 (±%)",
+        min_value=1.0,
+        max_value=10.0,
+        value=3.0,
+        step=0.5,
+    )
+
+TARGET_ALLOCATION = {
+    "市值型": target_market,
+    "高股息": target_dividend,
+    "全球型": target_global,
+    "主動型": target_active,
+    "債券": target_bond,
+}
+
+# -------------------------------------------------------------
+# 4. 主畫面：持股編輯器
 # -------------------------------------------------------------
 st.title("📊 投資組合資產配置與現金流監控")
 st.caption(
-    "💡 支援台美股即時報價、預估每月股息現金流計算與 Google Sheet 雙向同步"
+    "💡 支援台美股即時報價、自訂目標比例、預估每月股息現金流計算與 Google Sheet 雙向同步"
 )
 
 try:
@@ -163,7 +232,7 @@ if st.button("💾 儲存修改至雲端", type="primary"):
         st.error(f"儲存失敗: {e}")
 
 # -------------------------------------------------------------
-# 4. 市值計算與每月股息現金流統計
+# 5. 市值計算與每月股息現金流統計
 # -------------------------------------------------------------
 st.divider()
 valid_df = edited_df.dropna(subset=["代號"]).copy()
@@ -213,7 +282,7 @@ if not valid_df.empty:
         col_m4.metric("📌 持有標的數", f"{len(valid_df)} 檔")
 
         # -------------------------------------------------------------
-        # 5. 當月可用資金規劃
+        # 6. 當月可用資金規劃
         # -------------------------------------------------------------
         st.subheader("💵 當月可用投資資金規劃")
         col_inp, col_res = st.columns([1, 1])
@@ -235,7 +304,7 @@ if not valid_df.empty:
             )
 
         # -------------------------------------------------------------
-        # 6. 資產配置與再平衡建議
+        # 7. 目標 vs 實際配置分析與再平衡建議
         # -------------------------------------------------------------
         summary_rows = []
         under_allocated_cats = []
@@ -249,11 +318,11 @@ if not valid_df.empty:
             target_val = total_value * (target_pct / 100.0)
             rebalance_amt = target_val - cat_val
 
-            if diff_pct < -TOLERANCE_PCT:
+            if diff_pct < -tolerance_pct:
                 status = "📉 欠配 (Under)"
                 under_allocated_cats.append((cat, rebalance_amt))
                 sugg = f"比重偏低 **{diff_pct:.1f}%**，建議加碼約 **{rebalance_amt:,.0f}** 元"
-            elif diff_pct > TOLERANCE_PCT:
+            elif diff_pct > tolerance_pct:
                 status = "⚠️ 超配 (Over)"
                 sugg = f"比重偏高 **+{diff_pct:.1f}%**，建議暫停投入約 **{abs(rebalance_amt):,.0f}** 元"
             else:
@@ -305,7 +374,9 @@ if not valid_df.empty:
 
         # 資金分配指引
         st.subheader("💡 當月可用資金再平衡配置建議")
-        if total_investable > 0:
+        if total_target != 100.0:
+            st.warning("⚠️ 請先在左側邊欄將各資產類別比例調整至合計 100%。")
+        elif total_investable > 0:
             if under_allocated_cats:
                 total_under_need = sum([amt for _, amt in under_allocated_cats])
                 st.write(
