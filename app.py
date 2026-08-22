@@ -1,3 +1,4 @@
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -19,13 +20,14 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 def load_portfolio_data():
     """從 Google Sheet 讀取最新持股資料"""
     df = conn.read(ttl=0)
+    expected_cols = ["代號", "名稱", "類別", "持股數", "平均成本", "幣別"]
     if df is None or df.empty:
-        return pd.DataFrame(columns=["代號", "名稱", "類別", "持股數", "幣別"])
+        return pd.DataFrame(columns=expected_cols)
 
     df = df.dropna(how="all")
-    for col in ["代號", "名稱", "類別", "持股數", "幣別"]:
+    for col in expected_cols:
         if col not in df.columns:
-            df[col] = ""
+            df[col] = 0.0 if col in ["持股數", "平均成本"] else ""
     return df
 
 
@@ -187,9 +189,9 @@ TARGET_ALLOCATION = {
 # -------------------------------------------------------------
 # 4. 主畫面：持股編輯器
 # -------------------------------------------------------------
-st.title("📊 投資組合資產配置與現金流監控")
+st.title("📊 投資組合資產配置、損益與現金流監控")
 st.caption(
-    "💡 支援台美股即時報價、自訂目標比例、預估每月股息現金流計算與 Google Sheet 雙向同步"
+    "💡 支援即時股價、平均成本損益計算、自訂目標配置比例與 Google Sheet 雙向同步"
 )
 
 try:
@@ -197,7 +199,7 @@ try:
 except Exception as e:
     st.error(f"⚠️ 連線至 Google 試算表失敗，請檢查 secrets 設定。錯誤原因: {e}")
     current_df = pd.DataFrame(
-        columns=["代號", "名稱", "類別", "持股數", "幣別"]
+        columns=["代號", "名稱", "類別", "持股數", "平均成本", "幣別"]
     )
 
 st.subheader("✏️ 持股編輯器")
@@ -212,11 +214,14 @@ edited_df = st.data_editor(
         "類別": st.column_config.SelectboxColumn(
             "資產類別", options=list(TARGET_ALLOCATION.keys()), required=True
         ),
-        "幣別": st.column_config.SelectboxColumn(
-            "計價幣別", options=["TWD", "USD"], required=True
-        ),
         "持股數": st.column_config.NumberColumn(
             "持股數 (股)", min_value=0.0, step=100.0, required=True
+        ),
+        "平均成本": st.column_config.NumberColumn(
+            "平均買進成本 (原幣別)", min_value=0.0, step=0.1, required=False
+        ),
+        "幣別": st.column_config.SelectboxColumn(
+            "計價幣別", options=["TWD", "USD"], required=True
         ),
     },
     use_container_width=True,
@@ -232,57 +237,127 @@ if st.button("💾 儲存修改至雲端", type="primary"):
         st.error(f"儲存失敗: {e}")
 
 # -------------------------------------------------------------
-# 5. 市值計算與每月股息現金流統計
+# 5. 市值、損益與每月股息計算
 # -------------------------------------------------------------
 st.divider()
 valid_df = edited_df.dropna(subset=["代號"]).copy()
 
 if not valid_df.empty:
-    with st.spinner("正在爬取即時股價、配息歷史與匯率..."):
+    with st.spinner("正在爬取即時股價、計算成本損益與匯率..."):
         usd_rate = get_usd_twd_rate()
         prices = []
+        cost_totals = []
         market_values = []
+        pnl_twd_list = []
+        roi_pct_list = []
         monthly_div_per_share_list = []
         monthly_div_twd_list = []
 
         for _, row in valid_df.iterrows():
             sym = str(row["代號"]).strip()
             shares = float(row["持股數"]) if pd.notna(row["持股數"]) else 0.0
+            avg_cost = (
+                float(row["平均成本"]) if pd.notna(row["平均成本"]) else 0.0
+            )
             curr = str(row["幣別"]).strip()
 
             p, d_month = fetch_stock_info(sym)
             rate_factor = usd_rate if curr == "USD" else 1.0
 
+            total_cost_twd = avg_cost * shares * rate_factor
             val = p * shares * rate_factor
+            pnl_twd = val - total_cost_twd if avg_cost > 0 else 0.0
+            roi_pct = (
+                ((p - avg_cost) / avg_cost * 100.0)
+                if (avg_cost > 0 and p > 0)
+                else 0.0
+            )
             div_val = d_month * shares * rate_factor
 
             prices.append(p)
+            cost_totals.append(total_cost_twd)
             market_values.append(val)
+            pnl_twd_list.append(pnl_twd)
+            roi_pct_list.append(roi_pct)
             monthly_div_per_share_list.append(d_month)
             monthly_div_twd_list.append(div_val)
 
         calc_df = valid_df.copy()
         calc_df["即時單價"] = prices
+        calc_df["總成本(TWD)"] = cost_totals
         calc_df["市值(TWD)"] = market_values
+        calc_df["未實現損益(TWD)"] = pnl_twd_list
+        calc_df["報酬率(%)"] = roi_pct_list
         calc_df["預估月均每股配息"] = monthly_div_per_share_list
         calc_df["預估每月配息(TWD)"] = monthly_div_twd_list
 
         total_value = sum(market_values)
+        total_cost = sum(
+            [
+                c
+                for c, avg in zip(cost_totals, calc_df["平均成本"])
+                if float(avg) > 0
+            ]
+        )
+        total_pnl = sum(pnl_twd_list)
+        total_roi = (
+            (total_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
+        )
         total_monthly_dividends = sum(monthly_div_twd_list)
 
         # 頂部儀表板
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         col_m1.metric("💰 投資組合總市值", f"{total_value:,.0f} 元")
+
+        pnl_delta_str = f"{total_pnl:+,.0f} 元 ({total_roi:+.2f}%)"
         col_m2.metric(
+            label="📈 總未實現損益",
+            value=f"{total_pnl:,.0f} 元",
+            delta=f"{total_roi:+.2f}%",
+        )
+
+        col_m3.metric(
             "📅 預估每月平均股息",
             f"{total_monthly_dividends:,.0f} 元",
             help="基於各標的過去 12 個月歷史配息紀錄所折算之平均每月被動現金流",
         )
-        col_m3.metric("💵 USD/TWD 匯率", f"{usd_rate:.2f}")
-        col_m4.metric("📌 持有標的數", f"{len(valid_df)} 檔")
+        col_m4.metric("💵 USD/TWD 匯率", f"{usd_rate:.2f}")
 
         # -------------------------------------------------------------
-        # 6. 當月可用資金規劃
+        # 6. 個股損益明細表
+        # -------------------------------------------------------------
+        st.subheader("📑 各標的損益與即時行情明細")
+
+        display_df = calc_df[
+            [
+                "代號",
+                "名稱",
+                "類別",
+                "持股數",
+                "平均成本",
+                "即時單價",
+                "市值(TWD)",
+                "未實現損益(TWD)",
+                "報酬率(%)",
+            ]
+        ].copy()
+
+        st.dataframe(
+            display_df.style.format(
+                {
+                    "平均成本": "{:,.2f}",
+                    "即時單價": "{:,.2f}",
+                    "市值(TWD)": "{:,.0f} 元",
+                    "未實現損益(TWD)": "{:+,.0f} 元",
+                    "報酬率(%)": "{:+.2f}%",
+                    "持股數": "{:,.0f}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        # -------------------------------------------------------------
+        # 7. 當月可用資金規劃
         # -------------------------------------------------------------
         st.subheader("💵 當月可用投資資金規劃")
         col_inp, col_res = st.columns([1, 1])
@@ -304,7 +379,7 @@ if not valid_df.empty:
             )
 
         # -------------------------------------------------------------
-        # 7. 目標 vs 實際配置分析與再平衡建議
+        # 8. 目標 vs 實際配置分析與再平衡建議
         # -------------------------------------------------------------
         summary_rows = []
         under_allocated_cats = []
